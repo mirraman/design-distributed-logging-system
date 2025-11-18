@@ -6,7 +6,6 @@ members = [
 	"storage",
 	"search",
 	"config",
-	"examples/log-generator",
 	"integration-tests",
 ]
 resolver = '2'

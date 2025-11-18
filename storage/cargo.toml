@@ -15,5 +15,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-flate2 = "1"
-reqwest = { workspace = true }
+elasticsearch = "8.15.0-alpha.1"
+url = "2.5"

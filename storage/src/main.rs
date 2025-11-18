@@ -1,131 +1,340 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
-use chrono::{Duration, Utc};
-use common::{LogBatch, LogEntry, SearchQuery};
-use std::collections::HashMap;
+use chrono::{DateTime, Duration, Utc};
+use common::{LogBatch, LogEntry, LogLevel, SearchQuery};
+use elasticsearch::{
+    http::transport::{SingleNodeConnectionPool, TransportBuilder},
+    Elasticsearch, SearchParts, DeleteByQueryParts, BulkOperation,
+};
+use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info, warn};
+use url::Url;
 
-/// Упрощенное хранилище (в реальности - Elasticsearch)
-//TODO: Replace with actual storage
+const HOT_INDEX: &str = "logs-hot";
+const COLD_INDEX: &str = "logs-cold";
+
 struct LogStorage {
-    hot_storage: Arc<RwLock<Vec<LogEntry>>>, // 7 дней
-    cold_storage: Arc<RwLock<Vec<LogEntry>>>, // 30 дней
-    index: Arc<RwLock<HashMap<String, Vec<usize>>>>, // app_name -> индексы
+    client: Elasticsearch,
 }
 
 impl LogStorage {
-    fn new() -> Self {
-        Self {
-            hot_storage: Arc::new(RwLock::new(Vec::new())),
-            cold_storage: Arc::new(RwLock::new(Vec::new())),
-            index: Arc::new(RwLock::new(HashMap::new())),
+    async fn new(elasticsearch_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let url = Url::parse(elasticsearch_url)?;
+        
+        let conn_pool = SingleNodeConnectionPool::new(url);
+        let transport = TransportBuilder::new(conn_pool).disable_proxy().build()?;
+        let client = Elasticsearch::new(transport);
+
+        match client.ping().send().await {
+            Ok(_) => info!("Connected to Elasticsearch at {}", elasticsearch_url),
+            Err(e) => {
+                error!("Failed to connect to Elasticsearch: {}", e);
+                return Err(Box::new(e));
+            }
         }
+
+        let storage = Self { client };
+        
+        storage.init_indices().await?;
+        
+        Ok(storage)
+    }
+
+    async fn init_indices(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.create_index_if_not_exists(HOT_INDEX).await?;
+        
+        self.create_index_if_not_exists(COLD_INDEX).await?;
+        
+        Ok(())
+    }
+
+    async fn create_index_if_not_exists(&self, index_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let exists = self
+            .client
+            .indices()
+            .exists(elasticsearch::indices::IndicesExistsParts::Index(&[index_name]))
+            .send()
+            .await?;
+
+        if exists.status_code().is_success() {
+            info!("Index '{}' already exists", index_name);
+            return Ok(());
+        }
+
+        let response = self
+            .client
+            .indices()
+            .create(elasticsearch::indices::IndicesCreateParts::Index(index_name))
+            .body(json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval": "5s"
+                },
+                "mappings": {
+                    "properties": {
+                        "id": { "type": "keyword" },
+                        "app_name": { "type": "keyword" },
+                        "level": { "type": "keyword" },
+                        "timestamp": { "type": "date" },
+                        "message": { 
+                            "type": "text",
+                            "fields": {
+                                "keyword": { "type": "keyword", "ignore_above": 256 }
+                            }
+                        },
+                        "attributes": { "type": "object" }
+                    }
+                }
+            }))
+            .send()
+            .await?;
+
+        if response.status_code().is_success() {
+            info!("Created index '{}'", index_name);
+        } else {
+            warn!("Failed to create index '{}': {:?}", index_name, response.status_code());
+        }
+
+        Ok(())
     }
 
     async fn store(&self, batch: LogBatch) {
-        let mut hot = self.hot_storage.write().await;
-        let mut index = self.index.write().await;
+        let mut operations: Vec<BulkOperation<_>> = Vec::new();
 
-        for log in batch.logs {
-            let idx = hot.len();
+        for log in &batch.logs {
+            let doc = json!({
+                "id": log.id,
+                "app_name": log.app_name,
+                "level": format!("{:?}", log.level),
+                "timestamp": log.timestamp.to_rfc3339(),
+                "message": log.message,
+                "attributes": log.attributes
+            });
             
-            index
-                .entry(log.app_name.clone())
-                .or_insert_with(Vec::new)
-                .push(idx);
-
-            hot.push(log);
+            operations.push(BulkOperation::index(doc).id(&log.id).into());
         }
 
-        info!("Stored batch, total logs: {}", hot.len());
+        let response = self
+            .client
+            .bulk(elasticsearch::BulkParts::Index(HOT_INDEX))
+            .body(operations)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                if resp.status_code().is_success() {
+                    info!("Stored batch {} with {} logs to Elasticsearch", batch.batch_id, batch.logs.len());
+                } else {
+                    error!("Failed to store batch: {:?}", resp.status_code());
+                }
+            }
+            Err(e) => error!("Elasticsearch error: {}", e),
+        }
     }
 
     async fn search(&self, query: SearchQuery) -> Vec<LogEntry> {
-        let hot = self.hot_storage.read().await;
-        let cold = self.cold_storage.read().await;
+        let mut must_clauses: Vec<Value> = Vec::new();
 
-        let mut results = Vec::new();
+        if let Some(app_name) = &query.app_name {
+            must_clauses.push(json!({ "term": { "app_name": app_name } }));
+        }
 
-        for log in hot.iter() {
-            if self.matches(&log, &query) {
-                results.push(log.clone());
+        if let Some(level) = &query.level {
+            must_clauses.push(json!({ "term": { "level": format!("{:?}", level) } }));
+        }
+
+        if query.from.is_some() || query.to.is_some() {
+            let mut range = json!({});
+            if let Some(from) = query.from {
+                range["gte"] = json!(from.to_rfc3339());
+            }
+            if let Some(to) = query.to {
+                range["lte"] = json!(to.to_rfc3339());
+            }
+            must_clauses.push(json!({ "range": { "timestamp": range } }));
+        }
+
+        if let Some(attributes) = &query.attributes {
+            for (key, value) in attributes {
+                must_clauses.push(json!({
+                    "term": { format!("attributes.{}", key): value }
+                }));
             }
         }
 
-        if results.len() < query.limit.unwrap_or(100) {
-            for log in cold.iter() {
-                if self.matches(&log, &query) {
-                    results.push(log.clone());
+        let search_body = json!({
+            "query": {
+                "bool": {
+                    "must": if must_clauses.is_empty() { 
+                        vec![json!({ "match_all": {} })] 
+                    } else { 
+                        must_clauses 
+                    }
                 }
+            },
+            "size": query.limit.unwrap_or(100),
+            "sort": [{ "timestamp": { "order": "desc" } }]
+        });
+
+        let response = self
+            .client
+            .search(SearchParts::Index(&[HOT_INDEX, COLD_INDEX]))
+            .body(search_body)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                if let Ok(body) = resp.json::<Value>().await {
+                    let hits = body["hits"]["hits"].as_array();
+                    
+                    if let Some(hits) = hits {
+                        let logs: Vec<LogEntry> = hits
+                            .iter()
+                            .filter_map(|hit| {
+                                let source = &hit["_source"];
+                                self.parse_log_entry(source)
+                            })
+                            .collect();
+
+                        info!("Found {} logs matching query", logs.len());
+                        return logs;
+                    }
+                }
+                error!("Failed to parse search response");
+                Vec::new()
+            }
+            Err(e) => {
+                error!("Search error: {}", e);
+                Vec::new()
             }
         }
-
-        results.truncate(query.limit.unwrap_or(100));
-        results
     }
 
-    fn matches(&self, log: &LogEntry, query: &SearchQuery) -> bool {
-        if let Some(ref app) = query.app_name {
-            if &log.app_name != app {
-                return false;
-            }
-        }
+    fn parse_log_entry(&self, source: &Value) -> Option<LogEntry> {
+        let level_str = source["level"].as_str()?;
+        let level = match level_str {
+            "Debug" => LogLevel::Debug,
+            "Info" => LogLevel::Info,
+            "Warn" => LogLevel::Warn,
+            "Error" => LogLevel::Error,
+            _ => return None,
+        };
 
-        if let Some(ref level) = query.level {
-            if &log.level != level {
-                return false;
-            }
-        }
+        let timestamp_str = source["timestamp"].as_str()?;
+        let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
+            .ok()?
+            .with_timezone(&Utc);
 
-        if let Some(from) = query.from {
-            if log.timestamp < from {
-                return false;
-            }
-        }
+        let attributes = source["attributes"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if let Some(to) = query.to {
-            if log.timestamp > to {
-                return false;
-            }
-        }
-
-        if let Some(ref attrs) = query.attributes {
-            for (key, value) in attrs {
-                if log.attributes.get(key) != Some(value) {
-                    return false;
-                }
-            }
-        }
-
-        true
+        Some(LogEntry {
+            id: source["id"].as_str()?.to_string(),
+            app_name: source["app_name"].as_str()?.to_string(),
+            level,
+            timestamp,
+            message: source["message"].as_str()?.to_string(),
+            attributes,
+        })
     }
 
     async fn start_archiving(&self) {
-        let hot = self.hot_storage.clone();
-        let cold = self.cold_storage.clone();
+        let client = self.client.clone();
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await; 
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
 
-                let mut hot_store = hot.write().await;
-                let mut cold_store = cold.write().await;
+                info!("Starting archiving process...");
 
                 let now = Utc::now();
                 let seven_days_ago = now - Duration::days(7);
 
-                let (old, new): (Vec<LogEntry>, Vec<LogEntry>) = hot_store
-                    .drain(..)
-                    .partition(|log| log.timestamp < seven_days_ago);
+                let response = client
+                    .reindex()
+                    .body(json!({
+                        "source": {
+                            "index": HOT_INDEX,
+                            "query": {
+                                "range": {
+                                    "timestamp": {
+                                        "lt": seven_days_ago.to_rfc3339()
+                                    }
+                                }
+                            }
+                        },
+                        "dest": {
+                            "index": COLD_INDEX
+                        }
+                    }))
+                    .send()
+                    .await;
 
-                cold_store.extend(old);
-                *hot_store = new;
+                match response {
+                    Ok(resp) => {
+                        if resp.status_code().is_success() {
+                            info!("Moved old logs to cold storage");
 
-                info!("Archived {} logs to cold storage", cold_store.len());
+                            let delete_response = client
+                                .delete_by_query(DeleteByQueryParts::Index(&[HOT_INDEX]))
+                                .body(json!({
+                                    "query": {
+                                        "range": {
+                                            "timestamp": {
+                                                "lt": seven_days_ago.to_rfc3339()
+                                            }
+                                        }
+                                    }
+                                }))
+                                .send()
+                                .await;
+
+                            if let Ok(del_resp) = delete_response {
+                                if del_resp.status_code().is_success() {
+                                    info!("Cleaned up hot storage");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => error!("Archiving error: {}", e),
+                }
 
                 let thirty_days_ago = now - Duration::days(30);
-                cold_store.retain(|log| log.timestamp > thirty_days_ago);
+                let cleanup_response = client
+                    .delete_by_query(DeleteByQueryParts::Index(&[COLD_INDEX]))
+                    .body(json!({
+                        "query": {
+                            "range": {
+                                "timestamp": {
+                                    "lt": thirty_days_ago.to_rfc3339()
+                                }
+                            }
+                        }
+                    }))
+                    .send()
+                    .await;
+
+                match cleanup_response {
+                    Ok(resp) => {
+                        if resp.status_code().is_success() {
+                            info!("Cleaned up cold storage (>30 days)");
+                        }
+                    }
+                    Err(e) => error!("Cleanup error: {}", e),
+                }
+
+                info!("Archiving process completed");
             }
         });
     }
@@ -135,7 +344,21 @@ impl LogStorage {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let storage = Arc::new(LogStorage::new());
+    let elasticsearch_url = std::env::var("ELASTICSEARCH_URL")
+        .unwrap_or_else(|_| "http://localhost:9200".to_string());
+
+    info!("Starting Storage service...");
+    info!("Elasticsearch URL: {}", elasticsearch_url);
+
+    let storage = match LogStorage::new(&elasticsearch_url).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            error!("Failed to initialize Elasticsearch storage: {}", e);
+            error!("Make sure Elasticsearch is running at {}", elasticsearch_url);
+            std::process::exit(1);
+        }
+    };
+
     storage.start_archiving().await;
 
     let app = Router::new()
@@ -143,7 +366,7 @@ async fn main() {
         .route("/search", post(search_logs))
         .with_state(storage);
 
-    info!("Storage service starting on :8002");
+    info!("Storage service ready on :8002");
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8002").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
