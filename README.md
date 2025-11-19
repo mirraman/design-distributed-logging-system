@@ -7,9 +7,6 @@
                           ↓
                    [Config:8003]
 ```
-
-## Quick Start
-
 ### 1. Start All Services
 
 ```bash
